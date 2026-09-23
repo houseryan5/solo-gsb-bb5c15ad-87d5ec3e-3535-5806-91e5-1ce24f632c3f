@@ -21,6 +21,7 @@ from .bundle import (
 from .config import SERVICE_VERSION, Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
+from .ownership import audit_ownership
 from .planner import plan_release, simulate_plan
 from .rollback import preview_rollback
 from .schemas import (
@@ -31,6 +32,8 @@ from .schemas import (
     GateResult,
     GateWaveStatus,
     Issue,
+    OwnershipAuditRequest,
+    OwnershipAuditResult,
     PlanCreate,
     PlanDeleted,
     PlanImportResult,
@@ -69,7 +72,10 @@ app = FastAPI(
         "of a rollout against completed and failed services, preview "
         "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
-        "waves and dependency DAG, report per-service wave slack (float) of "
+        "waves and dependency DAG, audit service-to-team ownership against "
+        "the stored dependency graph, waves and fault domains (cross-team "
+        "dependencies, unowned services, on-call overload and fault-domain "
+        "team coupling), report per-service wave slack (float) of "
         "the stored minimum-wave plan, and offline-archive/restore complete "
         "plans as content-addressed (SHA-256) JSON bundles."
     ),
@@ -187,6 +193,29 @@ def _plan_not_found(plan_id: int) -> JSONResponse:
         ],
     ).model_dump()
     return JSONResponse(status_code=404, content=body)
+
+
+def _plan_not_found_unprocessable(plan_id: int) -> JSONResponse:
+    """Structured 422 variant for endpoints whose contract answers 422.
+
+    The ownership audit contract specifies a structured 422 (rather than the
+    404 used by the other plan routes) when the referenced plan does not
+    exist; the issue code and envelope shape stay identical so clients parse
+    one ``plan_not_found`` shape.
+    """
+    body = ErrorBody(
+        error="not_found",
+        message=f"Plan {plan_id} does not exist.",
+        issues=[
+            Issue(
+                code="plan_not_found",
+                message=f"Plan {plan_id} does not exist.",
+                constraint="plan_id",
+                context={"id": plan_id},
+            )
+        ],
+    ).model_dump()
+    return JSONResponse(status_code=422, content=body)
 
 
 # ---------------------------------------------------------------------------
@@ -656,4 +685,52 @@ def audit_plan_timeline(
         waves=output.waves,
         critical_chain=output.critical_chain,
         total_duration_ms=output.total_duration_ms,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/ownership-audit",
+    response_model=OwnershipAuditResult,
+    tags=["plans"],
+    responses={422: {"model": ErrorBody}},
+)
+def audit_plan_ownership(
+    plan_id: int,
+    payload: OwnershipAuditRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> OwnershipAuditResult:
+    """Read-only responsibility-domain audit over the stored graph.
+
+    The service -> team ownership map and the per-team simultaneous on-call
+    caps are projected onto the stored dependency graph, waves and fault
+    domains: cross-team dependency edges, the dependency-topological team
+    coordination order, services without an owner, per-team service counts
+    with per-wave on-call overloads and the teams coupled inside each fault
+    domain. The mapping need not cover every service (the uncovered ones are
+    returned as findings), but unknown or duplicate service entries, blank
+    owners and missing/non-positive caps are answered with a structured 422,
+    as is a reference to a plan that does not exist. The stored plan is read
+    but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found_unprocessable(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_members = [list(wave["services"]) for wave in stored["waves"]]
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+    domains = stored["fault_domains"]
+
+    output = audit_ownership(services, edges, wave_members, domains, payload)
+
+    return OwnershipAuditResult(
+        plan_id=row["id"],
+        name=row["name"],
+        wave_count=row["wave_count"],
+        teams=output.teams,
+        unowned_services=output.unowned_services,
+        cross_team_dependencies=output.cross_team_dependencies,
+        coordination_order=output.coordination_order,
+        fault_domain_coupling=output.fault_domain_coupling,
     )
