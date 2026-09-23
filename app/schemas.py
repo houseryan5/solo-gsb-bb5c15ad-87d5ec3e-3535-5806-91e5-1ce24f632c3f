@@ -8,7 +8,7 @@ expresses "services in this domain cannot co-locate in a wave".
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -199,6 +199,77 @@ class TimelineAuditRequest(BaseModel):
         min_length=1,
         description="One started_at/finished_at pair per service of the plan",
     )
+
+
+class ServiceOwner(BaseModel):
+    """Assignment of one service to the team responsible for it.
+
+    A blank/omitted ``team`` is an incomplete declaration and rejected with a
+    structured 422; to express "this service currently has no owner", simply
+    leave the service out of the mapping — it is then reported among the
+    unowned services. Each plan service may be assigned at most once.
+    """
+
+    service: str = Field(..., min_length=1, description="Service id of the stored plan")
+    team: str | None = Field(
+        default=None,
+        description="Responsible team id; null/blank is an incomplete assignment "
+        "(omit the entry to leave the service unowned)",
+    )
+
+    @field_validator("service")
+    @classmethod
+    def _strip_service_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("service id must not be blank")
+        return v
+
+    @field_validator("team")
+    @classmethod
+    def _blank_team_is_none(cls, v: str | None) -> str | None:
+        # A whitespace-only team name is not a team name: normalize to null
+        # so the ownership layer reports one consistent "missing owner" issue.
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class OwnershipAuditRequest(BaseModel):
+    """Service -> responsible-team mapping with per-team on-call caps.
+
+    The mapping may be partial: a plan service left out of ``service_owners``
+    is reported as unowned. Entries referencing unknown services, duplicate
+    service assignments, entries without a team and caps for teams that own
+    nothing are semantic errors (structured 422). Non-positive caps and blank
+    service/team ids are schema errors. The stored plan is never modified.
+    """
+
+    service_owners: list[ServiceOwner] = Field(
+        ...,
+        description="Service -> responsible team assignments; each plan "
+        "service at most once (uncovered services are reported as unowned)",
+    )
+    team_oncall_caps: dict[str, Annotated[int, Field(ge=1)]] = Field(
+        default_factory=dict,
+        description="Maximum number of the team's services that may be "
+        "released in the same wave (concurrent on-duty); teams without an "
+        "entry are uncapped",
+    )
+
+    @field_validator("team_oncall_caps")
+    @classmethod
+    def _strip_cap_team_ids(
+        cls, values: dict[str, int]
+    ) -> dict[str, int]:
+        cleaned: dict[str, int] = {}
+        for team, cap in values.items():
+            key = team.strip()
+            if not key:
+                raise ValueError("team id must not be blank")
+            cleaned[key] = cap
+        return cleaned
 
 
 # ---- Response models -------------------------------------------------------
@@ -461,6 +532,139 @@ class TimelineAuditResult(BaseModel):
         ...,
         ge=0,
         description="Earliest start to latest finish across every service",
+    )
+
+
+# ---- Ownership audit -------------------------------------------------------
+
+
+class TeamOwnership(BaseModel):
+    """One responsible team's footprint against the stored plan."""
+
+    team: str = Field(..., description="Team id")
+    service_count: int = Field(
+        ..., ge=0, description="Number of stored-plan services owned by the team"
+    )
+    services: list[str] = Field(
+        ..., description="Owned service ids of the stored plan, sorted"
+    )
+    oncall_cap: int | None = Field(
+        ...,
+        description="Concurrent per-wave on-call cap reported for the team; "
+        "null when no cap applies",
+    )
+    over_limit: list["TeamCapViolation"] = Field(
+        ...,
+        description="Stored waves in which more than oncall_cap of the team's "
+        "services release together, ordered by wave",
+    )
+
+
+class TeamCapViolation(BaseModel):
+    """A stored wave that exceeds a team's simultaneous on-call cap."""
+
+    wave: int = Field(..., ge=1, description="1-based stored wave index")
+    services: list[str] = Field(
+        ..., description="The team's services placed in this wave, sorted"
+    )
+    count: int = Field(..., ge=1, description="Number of those services")
+    cap: int = Field(..., ge=1, description="Reported per-team concurrent cap")
+    excess: int = Field(..., ge=1, description="count - cap")
+
+
+class CrossTeamDependency(BaseModel):
+    """One dependency edge whose two endpoints belong to different teams."""
+
+    service: str = Field(
+        ..., description="The depending (downstream) service"
+    )
+    service_team: str = Field(..., description="Team owning the depending service")
+    depends_on: str = Field(..., description="The prerequisite (upstream) service")
+    dependency_team: str = Field(..., description="Team owning the prerequisite service")
+
+
+class TeamDependency(BaseModel):
+    """Collapsed cross-team dependency between two teams (provider first)."""
+
+    provider_team: str = Field(
+        ...,
+        description="Team owning the prerequisite services; must coordinate "
+        "before the consumer team",
+    )
+    consumer_team: str = Field(
+        ..., description="Team owning the depending services"
+    )
+    edges: list[CrossTeamDependency] = Field(
+        ...,
+        description="Every service-level edge between the two teams, ordered "
+        "by consumer then provider service",
+    )
+
+
+class FaultDomainTeamCoupling(BaseModel):
+    """Teams coupled because their services share a stored fault domain.
+
+    Members of one anti-affinity domain can never release in the same wave, so
+    two teams owning members of the same domain must coordinate (their on-call
+    rotations cannot independently choose the same wave).
+    """
+
+    domain: str = Field(..., description="Stored fault-domain id")
+    teams: list[str] = Field(
+        ...,
+        description="Distinct teams owning members of the domain, sorted; "
+        "unowned members do not appear here",
+    )
+    services_by_team: dict[str, list[str]] = Field(
+        ...,
+        description="Domain members per owning team, each list sorted",
+    )
+    unowned_services: list[str] = Field(
+        ..., description="Domain members left without an owner, sorted"
+    )
+    coupled: bool = Field(
+        ...,
+        description="True when at least two distinct teams own members of "
+        "the domain",
+    )
+
+
+class OwnershipAuditResult(BaseModel):
+    """Outcome of a read-only responsibility-domain audit; never persisted."""
+
+    plan_id: int
+    name: str | None
+    teams: list[TeamOwnership] = Field(
+        ...,
+        description="One row per team named in the mapping, sorted by team id; "
+        "each lists the owned services and every cap-exceeding wave",
+    )
+    unowned_services: list[str] = Field(
+        ...,
+        description="Plan services absent from the service_owners mapping, sorted"
+    )
+    cross_team_dependencies: list[CrossTeamDependency] = Field(
+        ...,
+        description="Dependency edges joining different teams, ordered by "
+        "consumer service then prerequisite service; edges touching an "
+        "unowned service are excluded (the unowned endpoint is reported "
+        "separately in unowned_services)",
+    )
+    team_dependencies: list[TeamDependency] = Field(
+        ...,
+        description="The same cross-team edges collapsed to teams (provider "
+        "first), ordered by provider then consumer",
+    )
+    coordination_order: list[str] = Field(
+        ...,
+        description="Teams that must coordinate, in dependency-topological "
+        "order: a provider team precedes every consumer team; isolated teams "
+        "(no cross-team edges) are omitted; ties resolved lexicographically",
+    )
+    fault_domain_coupling: list[FaultDomainTeamCoupling] = Field(
+        ...,
+        description="Per stored fault domain the teams sharing it, in stored "
+        "domain order; domains with at least two teams are coupled",
     )
 
 

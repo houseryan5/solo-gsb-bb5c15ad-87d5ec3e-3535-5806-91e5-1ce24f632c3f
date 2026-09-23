@@ -21,6 +21,7 @@ from .bundle import (
 from .config import SERVICE_VERSION, Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
+from .ownership import audit_ownership
 from .planner import plan_release, simulate_plan
 from .rollback import preview_rollback
 from .schemas import (
@@ -31,6 +32,8 @@ from .schemas import (
     GateResult,
     GateWaveStatus,
     Issue,
+    OwnershipAuditRequest,
+    OwnershipAuditResult,
     PlanCreate,
     PlanDeleted,
     PlanImportResult,
@@ -70,7 +73,10 @@ app = FastAPI(
         "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
         "waves and dependency DAG, report per-service wave slack (float) of "
-        "the stored minimum-wave plan, and offline-archive/restore complete "
+        "the stored minimum-wave plan, audit service-to-team ownership "
+        "(cross-team dependency chains, unowned services, fault-domain team "
+        "coupling, dependency-topological coordination order and per-team "
+        "on-call cap violations), and offline-archive/restore complete "
         "plans as content-addressed (SHA-256) JSON bundles."
     ),
     lifespan=lifespan,
@@ -104,12 +110,14 @@ _SERVICE_LIST_FIELDS = (
     "failed_services",
     "deployed_services",
     "service_timelines",
+    "service_owners",
 )
 
 # Trailing loc elements that name a *property* of a nested object rather than
 # a service id, so they must not be reported as the offending service.
 _NESTED_FIELD_NAMES = frozenset(
-    ("service", "depends_on", "domain", "services", "started_at", "finished_at")
+    ("service", "depends_on", "domain", "services", "started_at",
+     "finished_at", "team")
 )
 
 
@@ -656,4 +664,57 @@ def audit_plan_timeline(
         waves=output.waves,
         critical_chain=output.critical_chain,
         total_duration_ms=output.total_duration_ms,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/ownership-audit",
+    response_model=OwnershipAuditResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def audit_plan_ownership(
+    plan_id: int,
+    payload: OwnershipAuditRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> OwnershipAuditResult:
+    """Audit team responsibility domains against the stored graph (read-only).
+
+    The request assigns plan services to responsible teams and optionally
+    declares each team's simultaneous on-call cap. The stored dependency
+    graph, stored waves and stored fault domains are used as-is (never
+    modified): the audit lists the cross-team dependency edges (per service
+    and collapsed to teams), the services without an owner, which teams are
+    coupled inside each fault domain, the dependency-topological order in
+    which teams must coordinate (provider teams first), and per team the
+    owned-service count plus every stored wave that exceeds its on-call cap.
+    Plan services left out of the mapping are reported as unowned; unknown
+    or duplicate assignments, ownerless entries and caps for teams without
+    services are 422.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_of = {
+        service: wave["index"]
+        for wave in stored["waves"]
+        for service in wave["services"]
+    }
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+    domains = stored["fault_domains"]
+
+    output = audit_ownership(services, edges, domains, wave_of, payload)
+
+    return OwnershipAuditResult(
+        plan_id=row["id"],
+        name=row["name"],
+        teams=output.teams,
+        unowned_services=output.unowned_services,
+        cross_team_dependencies=output.cross_team_dependencies,
+        team_dependencies=output.team_dependencies,
+        coordination_order=output.coordination_order,
+        fault_domain_coupling=output.fault_domain_coupling,
     )

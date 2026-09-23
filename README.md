@@ -11,6 +11,10 @@
 `POST /plans/{id}/timeline-audit` 对发布后实际上报的逐服务执行时间线做审计：按
 已存波次与依赖校验启动顺序、返回每条违规与重叠毫秒数，并给出各波实际耗时与依赖
 DAG 上按服务实际耗时加权的关键链（只读，不改方案）。
+`POST /plans/{id}/ownership-audit` 做**只读责任域（团队负责人）审计**：提交
+「服务 → 负责团队」映射与每团队同波值班上限后，沿已存依赖图给出跨团队依赖链、
+无负责人服务、故障域内的团队耦合，按依赖拓扑给出需要协同的团队顺序（前置团队在
+先），并逐团队返回负责服务数与超限波次（结果确定，不落库）。
 `GET /plans/{id}/slack-report` 只读计算当前最优波次方案的**服务松弛度**：在不增加
 总波次数且仍满足依赖、并发与故障域约束的前提下，每个服务最多可以向后移动几个波，
 并列出零松弛的关键服务及受其约束的零松弛下游（使用同一确定性求解器，结果不落库）。
@@ -449,6 +453,123 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 合法。审计为只读操作：重复请求得到相同结果（且与请求列表顺序无关），
 方案不存在返回 404。
 
+## 责任域审计（POST /plans/{id}/ownership-audit）
+
+把方案内**服务 → 负责团队**的映射，以及每个团队「同一波最多同时值班几个服务」的
+上限（`team_oncall_caps`，可只给部分团队）发给本接口。服务严格沿**已存储的依赖图、
+波次方案与故障域**（均不修改、不重排）计算以下结果，**只读不落库**：
+
+- **跨团队依赖链（cross_team_dependencies）**：每条两端分属不同团队的依赖边，
+  附依赖方与前置方服务 id 及各自团队；任一端无负责人的边无法归入团队对，不在此
+  列出（无负责人的端点单独在 `unowned_services` 中报告）。
+- **团队间依赖（team_dependencies）**：把上面的服务级跨团队边按团队折叠为
+  `provider_team → consumer_team`（前置团队 → 消费团队），每条附全部服务级边。
+- **协同顺序（coordination_order）**：仅含被跨团队依赖边连接的团队，按依赖拓扑
+  排序——前置团队排在所有消费团队之前，并列时按团队 id 字典序；与任何团队都没有
+  跨团队依赖的**孤立团队不出现**在顺序里。
+- **无负责人服务（unowned_services）**：映射中未出现的方案服务。映射**允许只覆盖
+  一部分**；要表达「暂无负责人」，直接不提交该服务即可。
+- **故障域内团队耦合（fault_domain_coupling）**：逐个已存故障域列出其中成员归属
+  的团队及各团队成员；同一域被 **≥2 个团队**分担时 `coupled=true`——这些团队的
+  服务永远不能同波发布，值班排班必须互相协同；无负责人成员单列。
+- **每团队负责情况（teams）**：按团队 id 排序，给出负责服务数、服务列表、值班上限
+  （未给上限为 `null`）与**超限项 over_limit**：已存波次中该团队同波服务数超过
+  `team_oncall_caps` 的每一波，含波次、服务列表、数量与超出数（按波次排序）。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/ownership-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "service_owners": [
+      {"service": "db",    "team": "data"},
+      {"service": "auth",  "team": "platform"},
+      {"service": "api",   "team": "platform"},
+      {"service": "web",   "team": "webteam"},
+      {"service": "cache", "team": "payments"}
+    ],
+    "team_oncall_caps": {
+      "data": 2,
+      "platform": 1,
+      "webteam": 2,
+      "payments": 1
+    }
+  }'
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`，`db`/`cache` 同属故障域 `az-a`）：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "teams": [
+    {"team": "data",     "service_count": 1, "services": ["db"],
+     "oncall_cap": 2, "over_limit": []},
+    {"team": "payments", "service_count": 1, "services": ["cache"],
+     "oncall_cap": 1, "over_limit": []},
+    {"team": "platform", "service_count": 2, "services": ["api", "auth"],
+     "oncall_cap": 1, "over_limit": []},
+    {"team": "webteam",  "service_count": 1, "services": ["web"],
+     "oncall_cap": 2, "over_limit": []}
+  ],
+  "unowned_services": [],
+  "cross_team_dependencies": [
+    {"service": "api",  "service_team": "platform", "depends_on": "db", "dependency_team": "data"},
+    {"service": "auth", "service_team": "platform", "depends_on": "db", "dependency_team": "data"},
+    {"service": "web",  "service_team": "webteam",  "depends_on": "api", "dependency_team": "platform"}
+  ],
+  "team_dependencies": [
+    {"provider_team": "data",     "consumer_team": "platform",
+     "edges": [
+       {"service": "api",  "service_team": "platform", "depends_on": "db", "dependency_team": "data"},
+       {"service": "auth", "service_team": "platform", "depends_on": "db", "dependency_team": "data"}
+     ]},
+    {"provider_team": "platform", "consumer_team": "webteam",
+     "edges": [
+       {"service": "web", "service_team": "webteam", "depends_on": "api", "dependency_team": "platform"}
+     ]}
+  ],
+  "coordination_order": ["data", "platform", "webteam"],
+  "fault_domain_coupling": [
+    {
+      "domain": "az-a",
+      "teams": ["data", "payments"],
+      "services_by_team": {"data": ["db"], "payments": ["cache"]},
+      "unowned_services": [],
+      "coupled": true
+    }
+  ]
+}
+```
+
+`data`（db）是 `platform`（auth、api）的前置，`platform` 又是 `webteam`（web）
+的前置，因此协同顺序为 `data → platform → webteam`；`payments` 的 `cache` 没有
+任何依赖边、是孤立团队，不出现在协同顺序中，但它与 `data` 通过故障域 `az-a`
+**耦合**（两团队服务永不同波）。本例 platform 的 `auth`、`api` 分处第 2、3 波，
+未触发上限 1；若把它们排入同一已存波，对应团队会出现：
+
+```json
+"over_limit": [
+  {"wave": 2, "services": ["auth", "api"], "count": 2, "cap": 1, "excess": 1}
+]
+```
+
+只覆盖部分服务是正常用法——未覆盖的服务进入 `unowned_services`，例如只给
+`a/b/c` 指定团队时 `d` 返回在该列表里；`service_owners` 传空数组则全部服务无
+负责人。映射本身做一致性校验，冲突时统一返回 **422**（信封同下）：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `unknown_service` | 映射引用了不属于本方案的服务 |
+| `duplicate_service_owner` | 同一服务被重复指定负责人（一个服务至多一个负责团队） |
+| `missing_service_owner` | 条目中缺少团队（`team` 缺省 / `null` / 全空白）；如要表达无负责人，应直接省略该条目 |
+| `unknown_team_cap` | `team_oncall_caps` 为某个**不负责本方案任何服务**的团队声明了上限 |
+
+此外，值班上限非正整数（`<1`）、类型错误、团队名为空白键等 schema 问题返回
+`validation_error`（错误定位到 `team_oncall_caps.<团队>`）；方案不存在返回 404。
+审计为只读操作：相同输入（含打乱条目顺序、cap 键序）永远得到相同结果，不写库。
+
 ## 服务松弛度报告（GET /plans/{id}/slack-report）
 
 对**已存储的最优波次方案**做只读的波次级松弛度（float）分析：在**总波次数不增加**
@@ -712,6 +833,9 @@ curl -X POST http://localhost:8000/plans/import \
 | `duplicate_service` | 回滚预览请求中同一服务重复出现 |
 | `missing_service_timeline` / `duplicate_service_timeline` | 时间线审计：方案服务缺失时间窗口 / 同一服务出现多条窗口 |
 | `timeline_inverted` | 时间线审计：某服务 `finished_at` 早于 `started_at` |
+| `unknown_service` / `duplicate_service_owner` | 责任域审计：映射引用未知服务 / 同一服务重复指定负责团队 |
+| `missing_service_owner` | 责任域审计：映射条目缺少团队（要表达无负责人应省略该条目，服务会进入 `unowned_services`） |
+| `unknown_team_cap` | 责任域审计：为不负责本方案任何服务的团队声明了同波值班上限 |
 | `bundle_checksum_mismatch` | 归档导入：声明的 SHA-256 与规范 JSON 实算不符（附 `declared`/`actual`） |
 | `bundle_format_unsupported` | 归档导入：归档格式或格式版本不受支持 |
 | `bundle_result_inconsistent` | 归档导入：归档波次不满足归档请求（依赖顺序/并发/故障域/窗口/覆盖不完整） |
@@ -726,6 +850,7 @@ curl -X POST http://localhost:8000/plans/import \
 | POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
 | POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
 | POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：逐服务上报实际起止时间，校验前一波屏障与直接依赖，返回每条违规（服务/约束对象/阻塞服务/重叠毫秒）、各波实际耗时与按服务耗时加权的依赖 DAG 关键链；覆盖缺失、重复、时间倒置或未知服务 422 |
+| POST | `/plans/{id}/ownership-audit` | 责任域审计（只读）：提交服务→团队映射与每团队同波值班上限，沿已存依赖图/波次/故障域计算跨团队依赖链与团队间依赖、无负责人服务、故障域团队耦合、依赖拓扑的团队协同顺序，以及每团队负责服务数与超限波次；未知/重复服务、缺少负责人或上限非法 422 |
 | GET | `/plans/{id}/slack-report` | 服务松弛度报告（只读）：用同一确定性求解器求每个服务在不加波且满足依赖/并发/故障域约束下最晚可到的波次与可后移波数，列出零松弛关键服务及其紧依赖零松弛下游；方案不存在 404 |
 | GET | `/plans/{id}/bundle` | 离线归档导出（只读）：规范 JSON 的请求约束 + 求解结果 + 版本元数据，附 `sha256` 与溯源信息；方案不存在 404 |
 | POST | `/plans/import` | 离线归档导入：先校验摘要、格式/schema、依赖/故障域引用与结果一致性，再事务写入新方案（波次原样保留、不重新求解）；新方案 201，重复摘要幂等 200（`reused=true`），任何校验失败 422 且零写入 |
@@ -776,11 +901,12 @@ app/
   gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
   rollback.py   # 回滚预览：上线集合依赖闭包校验、反向边回滚波次生成
   audit.py      # 执行时间线审计：波次/依赖顺序校验、违规重叠毫秒、实际耗时与加权关键链
+  ownership.py  # 责任域审计：跨团队依赖链、无负责人服务、故障域团队耦合、拓扑协同顺序、值班上限超限
   slack.py      # 服务松弛度：固定波次上界下逐服务最大化波次、零松弛关键服务与紧依赖下游
   bundle.py     # 离线归档：规范 JSON/SHA-256、导出组装、导入校验（摘要/schema/引用/结果一致性）
   db.py         # SQLite 初始化与 CRUD（含 bundle_sha256 幂等键与事务导入）
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/松弛度/归档/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/责任域审计/松弛度/归档/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt

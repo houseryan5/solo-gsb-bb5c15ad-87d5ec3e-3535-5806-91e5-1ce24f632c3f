@@ -1724,3 +1724,428 @@ def test_timeline_audit_is_deterministic(client):
         for body in (payload, shuffled, payload)
     ]
     assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/ownership-audit
+# ---------------------------------------------------------------------------
+
+
+def _payment_plan(client):
+    # Stored waves: [db] -> [auth] -> [api] -> [cache, web];
+    # db and cache share fault domain az-a.
+    payload = {
+        "name": "payment-platform",
+        "services": ["web", "api", "auth", "db", "cache"],
+        "dependencies": [
+            {"service": "web", "depends_on": "api"},
+            {"service": "api", "depends_on": "auth"},
+            {"service": "api", "depends_on": "db"},
+            {"service": "auth", "depends_on": "db"},
+        ],
+        "max_concurrency": 2,
+        "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+    }
+    plan = _create_plan(client, payload)
+    assert [w["services"] for w in plan["waves"]] == [
+        ["db"],
+        ["auth"],
+        ["api"],
+        ["cache", "web"],
+    ]
+    return plan
+
+
+def test_ownership_audit_cross_team_chains_and_coordination_order(client):
+    plan = _payment_plan(client)
+    payload = {
+        "service_owners": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "platform"},
+            {"service": "api", "team": "platform"},
+            {"service": "web", "team": "webteam"},
+            {"service": "cache", "team": "payments"},
+        ],
+        "team_oncall_caps": {
+            "data": 2,
+            "platform": 1,
+            "webteam": 2,
+            "payments": 1,
+        },
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["unowned_services"] == []
+
+    # Three cross-team edges, ordered by consumer team/service then provider.
+    assert [(e["service"], e["depends_on"], e["service_team"],
+             e["dependency_team"]) for e in body["cross_team_dependencies"]] == [
+        ("api", "db", "platform", "data"),
+        ("auth", "db", "platform", "data"),
+        ("web", "api", "webteam", "platform"),
+    ]
+
+    # Collapsed to provider -> consumer pairs.
+    pairs = [
+        (d["provider_team"], d["consumer_team"], len(d["edges"]))
+        for d in body["team_dependencies"]
+    ]
+    assert pairs == [("data", "platform", 2), ("platform", "webteam", 1)]
+    provider_first = body["team_dependencies"][0]
+    assert [(e["service"], e["depends_on"])
+            for e in provider_first["edges"]] == [("api", "db"), ("auth", "db")]
+
+    # Providers coordinate before consumers; the isolated 'payments' team
+    # (its member cache has no dependency edges at all) is omitted.
+    assert body["coordination_order"] == ["data", "platform", "webteam"]
+
+    # Per-team footprint, sorted by team id; no wave exceeds the caps here
+    # (platform services auth and api sit in different waves).
+    teams = {t["team"]: t for t in body["teams"]}
+    assert set(teams) == {"data", "platform", "webteam", "payments"}
+    assert teams["platform"]["service_count"] == 2
+    assert teams["platform"]["services"] == ["api", "auth"]
+    assert teams["platform"]["oncall_cap"] == 1
+    assert teams["platform"]["over_limit"] == []
+    assert teams["data"]["services"] == ["db"]
+    assert all(t["over_limit"] == [] for t in body["teams"])
+
+    # Fault domain az-a couples the data and payments teams.
+    assert len(body["fault_domain_coupling"]) == 1
+    coupling = body["fault_domain_coupling"][0]
+    assert coupling["domain"] == "az-a"
+    assert coupling["teams"] == ["data", "payments"]
+    assert coupling["services_by_team"] == {
+        "data": ["db"],
+        "payments": ["cache"],
+    }
+    assert coupling["unowned_services"] == []
+    assert coupling["coupled"] is True
+
+
+def test_ownership_audit_reports_over_limit_waves(client):
+    # BASE_PAYLOAD: waves [a] -> [b, c] -> [d]. data owns a, b, c with cap 1:
+    # wave 2 places both b and c on data's on-call rotation -> violation.
+    plan = _create_plan(client)
+    payload = {
+        "service_owners": [
+            {"service": "a", "team": "data"},
+            {"service": "b", "team": "data"},
+            {"service": "c", "team": "data"},
+        ],
+        "team_oncall_caps": {"data": 1},
+        # d intentionally left out: it must be reported unowned.
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["unowned_services"] == ["d"]
+
+    assert len(body["teams"]) == 1
+    team = body["teams"][0]
+    assert team["team"] == "data"
+    assert team["service_count"] == 3
+    assert team["services"] == ["a", "b", "c"]
+    assert team["over_limit"] == [
+        {"wave": 2, "services": ["b", "c"], "count": 2, "cap": 1, "excess": 1}
+    ]
+
+    # Edges touching the unowned service d are not cross-team edges; the
+    # single owned team has nobody to coordinate with.
+    assert body["cross_team_dependencies"] == []
+    assert body["team_dependencies"] == []
+    assert body["coordination_order"] == []
+    # No stored fault domains at all.
+    assert body["fault_domain_coupling"] == []
+
+
+def test_ownership_audit_multiple_over_limit_waves_sorted(client):
+    # Four independent services, cap 2: [a, b] -> [c, d]. Team 'ops' owns
+    # all four with on-call cap 1, so both waves violate.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    payload = {
+        "service_owners": [
+            {"service": s, "team": "ops"} for s in ("a", "b", "c", "d")
+        ],
+        "team_oncall_caps": {"ops": 1},
+    }
+    body = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload).json()
+    over = body["teams"][0]["over_limit"]
+    assert [v["wave"] for v in over] == [1, 2]
+    assert over[0]["services"] == ["a", "b"]
+    assert over[0]["excess"] == 1
+    assert over[1]["services"] == ["c", "d"]
+    # No cap -> no violations even with two services of one team in a wave.
+    payload["team_oncall_caps"] = {}
+    body = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload).json()
+    assert body["teams"][0]["oncall_cap"] is None
+    assert body["teams"][0]["over_limit"] == []
+
+
+def test_ownership_audit_unowned_members_in_fault_domain_are_listed(client):
+    # Domain with two teams plus an unowned member: coupled, and the member is
+    # reported per domain; a single-team domain is not coupled.
+    payload = {
+        "services": ["a", "b", "c", "d"],
+        "dependencies": [],
+        "max_concurrency": 4,
+        "fault_domains": [
+            {"domain": "az-1", "services": ["a", "b", "c"]},
+            {"domain": "az-2", "services": ["c", "d"]},
+        ],
+    }
+    plan = _create_plan(client, payload)
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "service_owners": [
+                {"service": "a", "team": "team-a"},
+                {"service": "b", "team": "team-b"},
+                # c and d unowned
+            ]
+        },
+    ).json()
+    domains = {d["domain"]: d for d in body["fault_domain_coupling"]}
+    assert set(domains) == {"az-1", "az-2"}
+    az1 = domains["az-1"]
+    assert az1["coupled"] is True
+    assert az1["teams"] == ["team-a", "team-b"]
+    assert az1["services_by_team"] == {"team-a": ["a"], "team-b": ["b"]}
+    assert az1["unowned_services"] == ["c"]
+    az2 = domains["az-2"]
+    assert az2["coupled"] is False
+    assert az2["teams"] == []
+    assert az2["unowned_services"] == ["c", "d"]
+    assert body["unowned_services"] == ["c", "d"]
+
+
+def test_ownership_audit_diamond_coordination_order(client):
+    # Providers 'p' and 'q' both feed consumer 'x'; x feeds 'y'. p and q are
+    # independent roots: Kahn with lexicographic tie-break yields
+    # [p, q, x, y]. Graph: b->a, c->b, d->b, e->d (a..e across teams).
+    payload = {
+        "services": ["a", "b", "c", "d", "e"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+            {"service": "d", "depends_on": "b"},
+            {"service": "e", "depends_on": "d"},
+        ],
+        "max_concurrency": 5,
+    }
+    plan = _create_plan(client, payload)
+    mapping = {
+        "service_owners": [
+            {"service": "a", "team": "p"},
+            {"service": "b", "team": "q"},
+            {"service": "c", "team": "x"},
+            {"service": "d", "team": "x"},
+            {"service": "e", "team": "y"},
+        ]
+    }
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit", json=mapping
+    ).json()
+    assert body["coordination_order"] == ["p", "q", "x", "y"]
+    assert {
+        (d["provider_team"], d["consumer_team"])
+        for d in body["team_dependencies"]
+    } == {("p", "q"), ("q", "x"), ("x", "y")}
+
+
+def test_ownership_audit_empty_mapping_everything_unowned(client):
+    plan = _create_plan(client)
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit", json={"service_owners": []}
+    ).json()
+    assert body["unowned_services"] == ["a", "b", "c", "d"]
+    assert body["teams"] == []
+    assert body["cross_team_dependencies"] == []
+    assert body["team_dependencies"] == []
+    assert body["coordination_order"] == []
+    assert all(d["coupled"] is False for d in body["fault_domain_coupling"])
+
+
+def test_ownership_audit_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "service_owners": [
+                {"service": "a", "team": "data"},
+                {"service": "a", "team": "ops"},
+            ]
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "duplicate_service_owner"
+    assert issue["constraint"] == "service_owners"
+    assert issue["service"] == "a"
+
+
+def test_ownership_audit_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={"service_owners": [{"service": "ghost", "team": "data"}]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "service_owners"
+    assert issue["service"] == "ghost"
+
+
+def test_ownership_audit_missing_owner_is_422(client):
+    plan = _create_plan(client)
+    for entry in ({"service": "a"}, {"service": "a", "team": None},
+                  {"service": "a", "team": "   "}):
+        r = client.post(
+            f"/plans/{plan['id']}/ownership-audit",
+            json={"service_owners": [entry]},
+        )
+        assert r.status_code == 422, r.text
+        issue = r.json()["issues"][0]
+        assert issue["code"] == "missing_service_owner"
+        assert issue["service"] == "a"
+        assert issue["constraint"] == "service_owners.service"
+
+
+def test_ownership_audit_unknown_team_cap_is_422(client):
+    plan = _create_plan(client)
+    # A cap for a team that owns nothing (a non-positive value would be a
+    # schema-level validation_error instead).
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "service_owners": [{"service": "a", "team": "data"}],
+            "team_oncall_caps": {"no-such-team": 2},
+        },
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_team_cap"
+    assert issue["constraint"] == "team_oncall_caps"
+    assert issue["context"] == {"team": "no-such-team", "cap": 2}
+
+
+def test_ownership_audit_invalid_cap_is_validation_error(client):
+    plan = _create_plan(client)
+    for caps in ({"data": 0}, {"data": -1}, {"data": "two"}):
+        r = client.post(
+            f"/plans/{plan['id']}/ownership-audit",
+            json={
+                "service_owners": [{"service": "a", "team": "data"}],
+                "team_oncall_caps": caps,
+            },
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["error"] == "validation_error"
+        assert body["issues"][0]["constraint"] == "team_oncall_caps.data"
+
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "service_owners": [{"service": "a", "team": "data"}],
+            "team_oncall_caps": {"   ": 2},
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_ownership_audit_multiple_issues_are_reported_together(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "service_owners": [
+                {"service": "a", "team": "data"},
+                {"service": "a", "team": "ops"},
+                {"service": "ghost", "team": "data"},
+            ]
+        },
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert codes == {"duplicate_service_owner", "unknown_service"}
+
+
+def test_ownership_audit_missing_plan_is_404(client):
+    # A well-formed body still gets 404: the plan lookup precedes validation.
+    r = client.post(
+        "/plans/9999/ownership-audit", json={"service_owners": []}
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"] == "not_found"
+    assert body["issues"][0]["code"] == "plan_not_found"
+
+
+def test_ownership_audit_does_not_modify_stored_plan(client):
+    plan = _payment_plan(client)
+    payload = {
+        "service_owners": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "platform"},
+            {"service": "api", "team": "platform"},
+            {"service": "web", "team": "webteam"},
+            {"service": "cache", "team": "payments"},
+        ],
+        "team_oncall_caps": {"platform": 1},
+    }
+    assert client.post(
+        f"/plans/{plan['id']}/ownership-audit", json=payload
+    ).status_code == 200
+    bad = {
+        "service_owners": [{"service": "ghost", "team": "data"}],
+        "team_oncall_caps": {"nobody": 1},
+    }
+    assert client.post(
+        f"/plans/{plan['id']}/ownership-audit", json=bad
+    ).status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_ownership_audit_is_deterministic_and_order_independent(client):
+    plan = _payment_plan(client)
+    entries = [
+        {"service": "db", "team": "data"},
+        {"service": "auth", "team": "platform"},
+        {"service": "api", "team": "platform"},
+        {"service": "web", "team": "webteam"},
+        {"service": "cache", "team": "payments"},
+    ]
+    caps = {"platform": 1, "data": 2, "webteam": 2, "payments": 1}
+    responses = [
+        client.post(
+            f"/plans/{plan['id']}/ownership-audit",
+            json={
+                "service_owners": reorder(entries),
+                "team_oncall_caps": caps,
+            },
+        ).json()
+        for reorder in (list, lambda xs: list(reversed(xs)), list)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+    # Cap key order must not matter either.
+    r1 = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={"service_owners": entries,
+              "team_oncall_caps": {"data": 2, "payments": 1,
+                                   "platform": 1, "webteam": 2}},
+    ).json()
+    assert r1 == responses[0]
